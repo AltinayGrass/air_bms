@@ -37,6 +37,8 @@ private:
      */
     std::string getStatusString(uint8_t status);
 
+    std::string getHealthString(uint8_t health);
+
     // --- Member Variables ---
 
     BMS_UART bms_; // Instance of the BMS UART communication class

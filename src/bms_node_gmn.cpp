@@ -1,11 +1,12 @@
 #include "air_bms/bms_node_gmn.hpp" // Include the corresponding header file
 
-#include <chrono>             // For std::chrono::seconds
+#include <chrono>             // For std::chrono::duration, std::chrono::nanoseconds
 #include <sstream>            // For std::ostringstream (used for logging)
 #include <rclcpp/rclcpp.hpp>  // ROS 2 C++ client library
 #include <sensor_msgs/msg/battery_state.hpp> // Standard ROS message for battery status
 #include <cmath>              // For std::nanf, std::abs
 #include <limits>             // For std::numeric_limits
+#include <stdexcept>          // For std::runtime_error in parameter validation
 
 // Use chrono literals for defining time durations (e.g., 1s)
 using namespace std::chrono_literals;
@@ -19,20 +20,39 @@ BatteryStatus::BatteryStatus() :
 {
     RCLCPP_INFO(this->get_logger(), "Initializing BMS Status Node...");
 
-    // Attempt to initialize the BMS serial communication settings
+    // --- Parameter Declaration ---
+    // Declare a parameter for the update/log interval in seconds. Default to 1.0 second.
+    this->declare_parameter<double>("update_interval_seconds", 1.0);
+
+    // --- Get Parameter Value ---
+    double update_interval_sec = this->get_parameter("update_interval_seconds").as_double();
+
+    // --- Parameter Validation ---
+    if (update_interval_sec <= 0.0) {
+        RCLCPP_WARN(this->get_logger(),
+                    "Invalid 'update_interval_seconds' parameter (%.2f). Must be positive. Using default 1.0s.",
+                    update_interval_sec);
+        update_interval_sec = 1.0; // Reset to a safe default
+    }
+    // Convert the interval from seconds (double) to std::chrono::duration
+    auto update_interval_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(update_interval_sec)
+    );
+
+
+    // --- BMS Hardware Initialization ---
     if (!bms_.Init())
     {
         // Log a fatal error and request shutdown if BMS initialization fails
         RCLCPP_FATAL(this->get_logger(), "BMS hardware initialization failed! Check port, permissions, and BMS power. Shutting down.");
-        // Signal ROS 2 to shutdown. Using rclcpp::shutdown() is generally preferred within a node's scope
-        // if initialization fails critically, rather than calling exit().
-        // Need a slight delay or separate thread to allow the shutdown to propagate if called directly here.
-        // A common pattern is to let the constructor return and check rclcpp::ok() in main.
-        // For simplicity here, we log FATAL and proceed, main() should handle the shutdown if ok() is false.
-         if (rclcpp::ok()) {
-             rclcpp::shutdown();
-         }
-        return; // Exit constructor early
+        // Signal ROS 2 to shutdown.
+        if (rclcpp::ok()) {
+            rclcpp::shutdown(nullptr, "BMS Initialization Failed"); // Add context to shutdown reason
+        }
+        // Throw an exception to prevent further initialization if shutdown doesn't happen immediately
+        throw std::runtime_error("BMS Hardware Initialization Failed");
+        // Note: Returning early might still allow main() to spin if not checked properly.
+        // Throwing or immediate shutdown is safer for critical init failures.
     }
 
     RCLCPP_INFO(this->get_logger(), "BMS hardware initialized successfully.");
@@ -40,27 +60,25 @@ BatteryStatus::BatteryStatus() :
     // --- ROS 2 Communication Setup ---
 
     // Create a publisher for the BatteryState message on the "bms_status" topic
-    // QoS setting: Use reliable communication, keep last 10 messages. Adjust if needed.
+    // QoS setting: Use reliable communication, keep last 10 messages.
     rclcpp::QoS qos_profile = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
     publisher_ = this->create_publisher<sensor_msgs::msg::BatteryState>("bms_status", qos_profile);
 
-    // Create a wall timer that triggers the BatteryStatusCallBack function every 1 second
+    // Create a wall timer that triggers the BatteryStatusCallBack function
+    // at the specified interval derived from the parameter.
     timer_ = this->create_wall_timer(
-        1s, // Use chrono literal for 1 second
+        update_interval_duration,
         std::bind(&BatteryStatus::BatteryStatusCallBack, this));
 
-    // --- Logging Setup ---
+    // Log the actual interval being used.
+    RCLCPP_INFO(this->get_logger(), "BMS Status node initialization complete. Publishing and logging data every %.2f s.",
+                 update_interval_sec);
 
-    // Initialize the time point for the last log message using the node's clock
-    // Set it initially so that the first check in the callback triggers a log immediately.
-    last_log_time_ = this->get_clock()->now() - LOG_INTERVAL;
-
-    RCLCPP_INFO(this->get_logger(), "BMS Status node initialization complete. Publishing data every 1s, logging summary every %ld s.",
-                 std::chrono::duration_cast<std::chrono::seconds>(LOG_INTERVAL.to_chrono<std::chrono::nanoseconds>()).count());
+    // Logging setup: No need for last_log_time_ anymore, as logging happens every timer callback.
 }
 
 /**
- * @brief Callback function triggered by the 1-second wall timer.
+ * @brief Callback function triggered by the wall timer at the configured interval.
  * @details Fetches data from BMS, handles errors, publishes BatteryState, and logs summary.
  */
 void BatteryStatus::BatteryStatusCallBack()
@@ -69,12 +87,13 @@ void BatteryStatus::BatteryStatusCallBack()
     // Call the update function of the BMS_UART class and get the communication status.
     BMS_UART::CommStatus status = bms_.update();
 
-    // Get the current time once for timestamping and logging interval check
+    // Get the current time once for timestamping
     rclcpp::Time now = this->get_clock()->now();
 
     // --- Handle Communication Status ---
     if (status != BMS_UART::CommStatus::SUCCESS) {
         // Log a warning indicating the failure and the specific status code
+        // Rate limit this warning? Maybe not necessary if timer interval is reasonably large.
         RCLCPP_WARN(this->get_logger(), "Failed to update BMS data! Status: %d", static_cast<int>(status));
 
         // Publish a BatteryState message indicating the error/unknown state
@@ -119,13 +138,11 @@ void BatteryStatus::BatteryStatusCallBack()
     // Populate the message fields using data directly from the bms_.get struct
     msg.voltage = bms_.get.packVoltage;           // Total battery pack voltage (Volts)
     msg.current = bms_.get.packCurrent;           // Current (Amperes). Positive=charging, Negative=discharging.
-    // Convert remaining capacity from mAh to Ah
-    msg.charge = static_cast<float>(bms_.get.resCapacitymAh) / 1000.0f;
+    msg.charge = static_cast<float>(bms_.get.resCapacitymAh) / 1000.0f; // Convert mAh to Ah
     msg.capacity = 46.0f;                         // Full charge capacity (Ah) - TODO: Get from BMS if possible, or make parameter
     msg.design_capacity = 46.0f;                  // Design capacity (Ah) - TODO: Get from BMS if possible, or make parameter
-    // Convert SOC from % (0-100) to ratio (0.0-1.0)
-    msg.percentage = bms_.get.packSOC / 100.0f;
-    msg.temperature = bms_.get.tempAverage;       // Average battery temperature (Celsius). Verify unit from BMS docs.
+    msg.percentage = bms_.get.packSOC / 100.0f; // Convert SOC from % (0-100) to ratio (0.0-1.0)
+    msg.temperature = bms_.get.tempAverage;       // Average battery temperature (Celsius). Verify unit.
     msg.present = true;                           // Indicate that the battery is present and data is valid
     msg.power_supply_technology = sensor_msgs::msg::BatteryState::POWER_SUPPLY_TECHNOLOGY_LION; // Set battery chemistry
 
@@ -138,13 +155,13 @@ void BatteryStatus::BatteryStatusCallBack()
             msg.power_supply_status = sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_DISCHARGING;
             break;
         case 0: // BMS indicates Stationary
-             // Infer based on current and SOC if possible
              if (std::abs(msg.current) < 0.1f && msg.percentage >= 0.98f) { // Near zero current and high SOC -> Full
                   msg.power_supply_status = sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_FULL;
              } else if (std::abs(msg.current) < 0.1f) { // Near zero current, not full -> Not Charging
                   msg.power_supply_status = sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_NOT_CHARGING;
-             } else { // Current is flowing but status is Stationary? Ambiguous case.
-                 msg.power_supply_status = sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_UNKNOWN;
+             } else { // Current is flowing but status is Stationary? Ambiguous case. Default to unknown or keep not_charging?
+                 msg.power_supply_status = sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_NOT_CHARGING; // Assume not charging if stationary but current != 0
+                 RCLCPP_DEBUG(this->get_logger(), "Ambiguous BMS status (Stationary with non-zero current: %.2f A). Reporting as NOT_CHARGING.", msg.current);
              }
             break;
         default: // Unknown status code from BMS
@@ -154,28 +171,27 @@ void BatteryStatus::BatteryStatusCallBack()
 
     // Populate individual cell voltages safely
     if (bms_.get.numberOfCells >= BMS_UART::MIN_NUMBER_CELLS && bms_.get.numberOfCells <= BMS_UART::MAX_NUMBER_CELLS) {
-        msg.cell_voltage.resize(bms_.get.numberOfCells); // Resize vector to hold voltage for each cell
+        msg.cell_voltage.resize(bms_.get.numberOfCells); // Resize vector
         for (int i = 0; i < bms_.get.numberOfCells; ++i) {
-            // Convert millivolts (mV) from BMS to volts (V) for the message
-            msg.cell_voltage[i] = bms_.get.cellVmV[i] / 1000.0f;
+            msg.cell_voltage[i] = bms_.get.cellVmV[i] / 1000.0f; // Convert mV to V
         }
     } else {
-         // Handle invalid number of cells reported, even if update() succeeded overall
          if (bms_.get.numberOfCells != 0) { // Avoid logging if 0 cells reported (might be initial state)
             RCLCPP_WARN(this->get_logger(), "Invalid number of cells (%d) reported by BMS, clearing cell_voltage field.", bms_.get.numberOfCells);
          }
-         msg.cell_voltage.clear(); // Ensure the vector is empty if cell count is invalid
+         msg.cell_voltage.clear();
     }
 
     // Determine battery health based on alarm flags from bms_.alarm struct
-    // Check most critical alarms first
+    // (Keeping the existing detailed health logic)
     if (bms_.alarm.levelTwoCellVoltageTooHigh || bms_.alarm.levelTwoPackVoltageTooHigh ||
         bms_.alarm.levelOneCellVoltageTooHigh || bms_.alarm.levelOnePackVoltageTooHigh) {
         msg.power_supply_health = sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_OVERVOLTAGE;
     } else if (bms_.alarm.levelTwoCellVoltageTooLow || bms_.alarm.levelTwoPackVoltageTooLow ||
                bms_.alarm.levelOneCellVoltageTooLow || bms_.alarm.levelOnePackVoltageTooLow ||
                bms_.alarm.failureOfLowVoltageNoCharging) {
-        msg.power_supply_health = sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_DEAD; // Or HEALTH_UNKNOWN
+        // Consider if DEAD is too strong. Maybe UNSPEC_FAILURE or UNKNOWN if recoverable?
+        msg.power_supply_health = sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_DEAD;
     } else if (bms_.alarm.levelTwoDischargeTempTooHigh || bms_.alarm.levelTwoChargeTempTooHigh ||
                bms_.alarm.levelOneDischargeTempTooHigh || bms_.alarm.levelOneChargeTempTooHigh ||
                bms_.alarm.chargeFETTemperatureTooHigh || bms_.alarm.dischargeFETTemperatureTooHigh) {
@@ -185,7 +201,9 @@ void BatteryStatus::BatteryStatusCallBack()
         msg.power_supply_health = sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_COLD;
     } else if (bms_.alarm.levelTwoDischargeCurrentTooHigh || bms_.alarm.levelTwoChargeCurrentTooHigh ||
                bms_.alarm.levelOneDischargeCurrentTooHigh || bms_.alarm.levelOneChargeCurrentTooHigh) {
-        msg.power_supply_health = sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_OVERVOLTAGE; // No specific OVERCURRENT health state, use OVERVOLTAGE as proxy? or UNKNOWN?
+        // No specific OVERCURRENT health state. Using UNSPEC_FAILURE might be better than OVERVOLTAGE.
+        msg.power_supply_health = sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
+         RCLCPP_WARN_ONCE(this->get_logger(), "BMS reports overcurrent condition, mapping to UNSPEC_FAILURE health state.");
     } else if (bms_.alarm.failureOfAFEAcquisitionModule || bms_.alarm.failureOfVoltageSensorModule ||
                bms_.alarm.failureOfTemperatureSensorModule || bms_.alarm.failureOfEEPROMStorageModule ||
                bms_.alarm.failureOfCurrentSensorModule || bms_.alarm.failureOfMainVoltageSensorModule) {
@@ -198,29 +216,25 @@ void BatteryStatus::BatteryStatusCallBack()
     // --- Publishing ---
     publisher_->publish(msg);
 
-    // --- Conditional Logging (every LOG_INTERVAL seconds) ---
-    if (now - last_log_time_ >= LOG_INTERVAL)
-    {
-        // Prepare the log string using an output string stream for better formatting
-        std::ostringstream log_bms;
-        log_bms << "\n--- BMS Status Summary (SUCCESS) ---"
-                // Include raw status string from BMS and mapped ROS status string
-                << "\n[ Charge Status ] : " << bms_.get.chargeDischargeStatus << " (" << getStatusString(msg.power_supply_status) << ")"
-                << "\n[ Voltage ]       : " << msg.voltage << " V"
-                << "\n[ Current ]       : " << msg.current << " A"
-                << "\n[ State of Charge ] : " << msg.percentage * 100.0 << " %"
-                << "\n[ Temperature (Avg) ] : " << msg.temperature << " C" // Ensure unit is Celsius
-                << "\n[ Remaining Capacity ]: " << msg.charge << " Ah"
-                << "\n[ BMS Heartbeat ] : " << bms_.get.bmsHeartBeat // Assuming this is a counter or status indicator
-                << "\n[ Cycle Count ]   : " << bms_.get.bmsCycles
-                << "\n[ Health Status ] : " << static_cast<int>(msg.power_supply_health); // Log health code
+    // --- Logging (runs every time the callback is executed successfully) ---
+    // Prepare the log string using an output string stream
+    std::ostringstream log_bms;
+    log_bms << "\n--- BMS Status Summary (SUCCESS) ---"
+            << "\n[ Timestamp ]     : " << now.seconds() // Log timestamp for context
+            << "\n[ Charge Status ] : " << bms_.get.chargeDischargeStatus << " (" << getStatusString(msg.power_supply_status) << ")"
+            << "\n[ Voltage ]       : " << msg.voltage << " V"
+            << "\n[ Current ]       : " << msg.current << " A"
+            << "\n[ State of Charge ] : " << msg.percentage * 100.0 << " %"
+            << "\n[ Temperature (Avg) ] : " << msg.temperature << " C"
+            << "\n[ Remaining Capacity ]: " << msg.charge << " Ah"
+            << "\n[ BMS Heartbeat ] : " << bms_.get.bmsHeartBeat
+            << "\n[ Cycle Count ]   : " << bms_.get.bmsCycles
+            << "\n[ Health Status ] : " << getHealthString(msg.power_supply_health) << " (" << static_cast<int>(msg.power_supply_health) << ")"; // Log health string and code
 
-        // Log the formatted string using RCLCPP_INFO level
-        RCLCPP_INFO(this->get_logger(), "%s", log_bms.str().c_str());
+    // Log the formatted string using RCLCPP_INFO level
+    RCLCPP_INFO(this->get_logger(), "%s", log_bms.str().c_str());
 
-        // Update the time of the last log message
-        last_log_time_ = now;
-    }
+    // No need to update last_log_time_ anymore
 }
 
 /**
@@ -237,53 +251,82 @@ std::string BatteryStatus::getStatusString(uint8_t status) {
     }
 }
 
+/**
+ * @brief Helper function to convert power supply health enum to string for logging.
+ */
+std::string BatteryStatus::getHealthString(uint8_t health) {
+     switch (health) {
+        case sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_GOOD:            return "Good";
+        case sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_OVERHEAT:        return "Overheat";
+        case sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_DEAD:            return "Dead/Deep Discharge";
+        case sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_OVERVOLTAGE:     return "Overvoltage";
+        case sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_UNSPEC_FAILURE:  return "Unspecified Failure/Overcurrent";
+        case sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_COLD:            return "Cold";
+        case sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_WATCHDOG_TIMER_EXPIRE: return "Watchdog Expired"; // If applicable
+        case sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_SAFETY_TIMER_EXPIRE: return "Safety Timer Expired"; // If applicable
+        case sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_UNKNOWN:
+        default:                                                                  return "Unknown";
+    }
+}
+
 
 // --- Main Function ---
-// Entry point of the program
 int main(int argc, char **argv)
 {
-    // Initialize the ROS 2 C++ client library
     rclcpp::init(argc, argv);
 
     std::shared_ptr<BatteryStatus> node = nullptr;
     try {
-        // Create a shared pointer to an instance of the BatteryStatus node
         node = std::make_shared<BatteryStatus>();
 
-        // Check if ROS 2 is still okay (initialization might have failed and requested shutdown)
+        // Initialization check: If node constructor requested shutdown or threw, rclcpp::ok() might be false
         if (rclcpp::ok()) {
            RCLCPP_INFO(node->get_logger(), "Starting BMS Status node spin loop.");
-           // Spin the node, making it process callbacks (timers, subscriptions, etc.)
-           // This keeps the node alive and responsive until shutdown is called externally or internally.
            rclcpp::spin(node);
         } else {
-            // Log if initialization failed leading to immediate shutdown request
-             std::cerr << "ROS 2 shutdown requested during node initialization." << std::endl;
+           // Node likely failed initialization, logging handled inside constructor/exception
+           std::cerr << "ROS 2 shutdown requested or node initialization failed before spin." << std::endl;
         }
 
-    } catch (const std::exception & e) {
-        // Catch potential exceptions during node creation or spinning
-        // Using std::cerr here as logger might not be available if node creation failed badly
-        std::cerr << "Unhandled exception in BMS node: " << e.what() << std::endl;
-        // Ensure shutdown is called even if spin didn't start/finish cleanly
+    } // --- CATCH BLOCK ORDERING FIX ---
+    // Catch the more specific exception type FIRST
+    catch (const rclcpp::exceptions::InvalidParameterValueException & e) {
+        std::cerr << "Invalid parameter value exception: " << e.what() << std::endl;
         if (rclcpp::ok()) {
-            rclcpp::shutdown();
-        }
-        return 1; // Indicate error exit
-    } catch (...) {
-         std::cerr << "Unknown exception in BMS node." << std::endl;
-          if (rclcpp::ok()) {
-            rclcpp::shutdown();
+            rclcpp::shutdown(nullptr, "Invalid Parameter");
         }
         return 1;
     }
+    // Catch the base exception type AFTER its derived types
+    catch (const std::runtime_error & e) {
+        // Catch initialization error specifically
+        std::cerr << "Runtime error during BMS node execution: " << e.what() << std::endl; // Message changed slightly for clarity
+        // Ensure shutdown is called
+        if (rclcpp::ok()) {
+            rclcpp::shutdown(nullptr, "Runtime Error"); // Updated reason
+        }
+        return 1; // Indicate error exit
+    }
+    // Catch other standard exceptions
+    catch (const std::exception & e) {
+        std::cerr << "Unhandled standard exception in BMS node: " << e.what() << std::endl; // Message changed slightly
+        if (rclcpp::ok()) {
+            rclcpp::shutdown(nullptr, "Unhandled Standard Exception"); // Updated reason
+        }
+        return 1;
+    }
+    // Catch any other unknown exceptions (should be last)
+    catch (...) {
+        std::cerr << "Unknown exception in BMS node." << std::endl;
+        if (rclcpp::ok()) {
+        rclcpp::shutdown(nullptr, "Unknown Exception");
+    }
+    return 1;
+    }
 
-
-    // Shutdown the ROS 2 C++ client library cleanly (if not already done)
-    // Note: rclcpp::shutdown() can be called multiple times safely.
+    // Shutdown is likely already called on error or external signal, but call again ensures cleanup.
     rclcpp::shutdown();
 
     std::cout << "BMS Status node finished." << std::endl;
-    // Return 0 indicating successful execution (or controlled shutdown)
     return 0;
 }

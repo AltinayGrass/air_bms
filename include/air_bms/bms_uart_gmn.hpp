@@ -342,7 +342,7 @@ private:
 
     // Configuration for timeouts (can be adjusted)
     static constexpr std::chrono::milliseconds READ_TIMEOUT_MS{2000L}; // Base timeout for a single receive operation (might be extended for multi-frame)
-    static constexpr std::chrono::seconds OVERALL_TIMEOUT_S{10L};       // Overall timeout if no successful communication occurs
+    static constexpr std::chrono::seconds OVERALL_TIMEOUT_S{360L};       // Overall timeout if no successful communication occurs
 };
 
 #endif //BMS_UART_HPP

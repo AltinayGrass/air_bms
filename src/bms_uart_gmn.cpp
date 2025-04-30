@@ -670,8 +670,9 @@
      if (!parse_success) {
          std::cerr << "BMS_UART Error: Failed to parse data for command 0x" << std::hex << static_cast<int>(cmdID) << std::dec << std::endl;
          current_status_ = CommStatus::ERROR_PARSE_FAIL; // Use a sp/ Gerekli
-     return CommStatus::SUCCESS;
- }
+     return current_status_;
+    }
+    return CommStatus::SUCCESS;
 }
  
  /**
